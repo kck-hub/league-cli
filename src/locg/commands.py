@@ -193,11 +193,48 @@ def cmd_comic(client: LOCGClient, comic_id: int) -> dict[str, Any]:
     soup = parse_page(resp.text)
     detail = extract_comic_detail(soup)
     if detail.get("lists") is not None:
-        detail["lists"], detail["lists_source"] = _resolve_lists(
+        _apply_resolution(detail, _resolve_lists(
             client, comic_id, detail, detail["lists"],
-        )
-        detail["requested_id"] = comic_id  # ``id`` is the page's canonical id, which differs for variants
+            variant_words=_page_variant_words(soup, detail.get("name")),
+        ), comic_id)
     return detail
+
+
+def _page_variant_words(soup: Any, plain_name: Optional[str]) -> Optional[str]:
+    """Variant text from the /comic page title, e.g. "Alex Ross ... Variant".
+
+    The h1 shows only the standard title ("Captain America #13"); the
+    ``<title>`` / ``og:title`` carry the full variant name. Returns the part
+    after the issue number, or None when there is none.
+    """
+    candidates = []
+    og = soup.find("meta", attrs={"property": "og:title"})
+    if og and og.get("content"):
+        candidates.append(og["content"])
+    if soup.title and soup.title.string:
+        candidates.append(soup.title.string)
+    for text in candidates:
+        text = re.split(r"\s+[|\u2013\u2014-]\s+", text.strip())[0]
+        m = re.search(r"#\s*\S+\s+(.+)$", text)
+        if m:
+            words = m.group(1).strip()
+            if words and (not plain_name or words not in plain_name):
+                return words
+    return None
+
+
+def _apply_resolution(entry: dict[str, Any], res: tuple, comic_id: int) -> None:
+    """Write a ``_resolve_lists`` result into a check/comic entry."""
+    lists, source, row, warning = res
+    entry["lists"], entry["lists_source"] = lists, source
+    if row is not None:
+        # The page reports the standard cover's id/name for a variant; the
+        # matched row is the requested variant itself.
+        entry["id"] = comic_id
+        entry["name"] = row.get("full_title") or row.get("name") or entry.get("name")
+    if warning:
+        entry["warning"] = warning
+    entry["requested_id"] = comic_id
 
 
 def _resolve_lists(
@@ -206,35 +243,56 @@ def _resolve_lists(
     page: dict[str, Any],
     page_lists: Optional[dict[str, Any]],
     cache: Optional[dict[tuple[int, str], list[dict[str, Any]]]] = None,
-) -> tuple[Optional[dict[str, Any]], str]:
+    variant_words: Optional[str] = None,
+) -> tuple[Optional[dict[str, Any]], str, Optional[dict[str, Any]], Optional[str]]:
     """Pick the right ``lists`` flags for ``comic_id``.
 
-    The /comic/<id> page only reflects the standard cover's list state, so
-    for a variant it reports collection false even when you own it. The series
+    The /comic/<id> page only reflects the standard cover (its id, name and
+    list state), so for a variant it reports the plain entry. The series
     ``find`` rows carry accurate per-variant flags: use the row whose id
-    matches, and fall back to the page flags (``comic-page``) when the page
-    has no series/issue or no row matches. Returns ``(lists, source)``.
+    matches. If the id is missing from the rows (list truncated), retry the
+    find filtered by ``variant_words``; if still missing, return the page
+    flags (``comic-page``) with a warning when the page is a different entry.
+    Returns ``(lists, source, matched_row, warning)``.
     """
     series_id = page.get("series_id")
     m = re.search(r"#\s*(\S+)", page.get("name") or "")
     if not series_id or not m:
-        return page_lists, "comic-page"
+        return page_lists, "comic-page", None, None
     issue = m.group(1)
-    key = (int(series_id), issue)
-    if cache is not None and key in cache:
-        rows = cache[key]
-    else:
+
+    def rows_for(variant: Optional[str]) -> list[dict[str, Any]]:
+        key = (int(series_id), issue if not variant else f"{issue}\x00{variant}")
+        if cache is not None and key in cache:
+            return cache[key]
         try:
-            rows = cmd_find(client, int(series_id), issue, legacy_printing=False)
+            rows = cmd_find(client, int(series_id), issue, variant=variant, legacy_printing=False)
         except Exception as exc:  # fall back rather than fail the check
             logger.warning("find rows unavailable for comic %s: %s", comic_id, exc)
             rows = []
         if cache is not None:
             cache[key] = rows
-    for row in rows:
-        if row.get("id") == comic_id and row.get("lists") is not None:
-            return row["lists"], "find-row"
-    return page_lists, "comic-page"
+        return rows
+
+    def match(rows: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        for row in rows:
+            if row.get("id") == comic_id and row.get("lists") is not None:
+                return row
+        return None
+
+    row = match(rows_for(None))
+    if row is None and variant_words:
+        row = match(rows_for(variant_words))
+    if row is not None:
+        return row["lists"], "find-row", row, None
+    warning = None
+    if page.get("id") and page.get("id") != comic_id:
+        warning = (
+            f"id {comic_id} not found in series {series_id} #{issue} find rows; "
+            f"lists are from the comic page, which shows entry {page.get('id')} "
+            f"({page.get('name')}), not the requested variant"
+        )
+    return page_lists, "comic-page", None, warning
 
 
 def cmd_series(client: LOCGClient, series_id: int) -> dict[str, Any]:
@@ -1035,10 +1093,10 @@ def cmd_check_lists(client: LOCGClient, comic_ids: list[int]) -> list[dict[str, 
         if "id" not in entry:
             entry["id"] = comic_id
         page = extract_comic_detail(soup)
-        entry["lists"], entry["lists_source"] = _resolve_lists(
+        _apply_resolution(entry, _resolve_lists(
             client, comic_id, page, entry.get("lists"), find_cache,
-        )
-        entry["requested_id"] = comic_id
+            variant_words=_page_variant_words(soup, page.get("name")),
+        ), comic_id)
         results.append(entry)
     return results
 

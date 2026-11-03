@@ -2129,3 +2129,75 @@ def test_cmd_comic_uses_find_row(mock_client, monkeypatch):
     result = cmds.cmd_comic(mock_client, 7)
     assert result["lists"]["collection"] is True
     assert result["lists_source"] == "find-row"
+
+
+# Recorded from live League 2026-11-02: variant id 5102776's /comic page shows
+# the standard cover (canonical id 3021631, h1 "Captain America #13"), while
+# the series find rows hold both entries with their own flags.
+_CAP13_PLAIN = {"id": 3021631, "name": "Captain America #13", "full_title": "Captain America #13",
+                "lists": {"pull": False, "collection": False, "wish": False, "read": False}}
+_CAP13_ROSS = {"id": 5102776, "name": "Captain America #13",
+               "full_title": "Captain America #13 Alex Ross Marvel Dimensions Virgin Variant",
+               "lists": {"pull": False, "collection": True, "wish": False, "read": False}}
+
+
+def _cap13_page() -> str:
+    html = _variant_page(3021631, "Captain America #13", 186397)
+    return html.replace(
+        "<head>",
+        "<head><title>Captain America #13 Alex Ross Marvel Dimensions Virgin Variant"
+        " | League of Comic Geeks</title>",
+        1,
+    )
+
+
+def test_cmd_check_lists_variant_returns_matching_row_identity(mock_client, monkeypatch):
+    import locg.commands as cmds
+
+    mock_client.get.return_value = MagicMock(status_code=200, text=_cap13_page())
+    monkeypatch.setattr(cmds, "cmd_find", lambda *a, **k: [_CAP13_PLAIN, _CAP13_ROSS])
+    entry = cmd_check_lists(mock_client, [5102776])[0]
+    assert entry["id"] == 5102776 == entry["requested_id"]
+    assert entry["name"] == _CAP13_ROSS["full_title"]
+    assert entry["lists"] == _CAP13_ROSS["lists"]
+    assert entry["lists_source"] == "find-row"
+    assert "warning" not in entry
+
+
+def test_cmd_comic_variant_returns_matching_row_identity(mock_client, monkeypatch):
+    import locg.commands as cmds
+
+    mock_client.get.return_value = MagicMock(status_code=200, text=_cap13_page())
+    monkeypatch.setattr(cmds, "cmd_find", lambda *a, **k: [_CAP13_PLAIN, _CAP13_ROSS])
+    detail = cmds.cmd_comic(mock_client, 5102776)
+    assert detail["id"] == 5102776
+    assert detail["lists"]["collection"] is True
+    assert detail["lists_source"] == "find-row"
+
+
+def test_check_truncated_rows_retries_with_variant_words(mock_client, monkeypatch):
+    import locg.commands as cmds
+
+    mock_client.get.return_value = MagicMock(status_code=200, text=_cap13_page())
+    calls = []
+
+    def fake_find(client, series_id, issue, variant=None, **kw):
+        calls.append(variant)
+        return [_CAP13_ROSS] if variant else [_CAP13_PLAIN]  # first list truncated
+
+    monkeypatch.setattr(cmds, "cmd_find", fake_find)
+    entry = cmd_check_lists(mock_client, [5102776])[0]
+    assert calls == [None, "Alex Ross Marvel Dimensions Virgin Variant"]
+    assert entry["id"] == 5102776
+    assert entry["lists_source"] == "find-row"
+
+
+def test_check_missing_variant_warns_instead_of_substituting(mock_client, monkeypatch):
+    import locg.commands as cmds
+
+    mock_client.get.return_value = MagicMock(status_code=200, text=_cap13_page())
+    monkeypatch.setattr(cmds, "cmd_find", lambda *a, **k: [_CAP13_PLAIN])
+    entry = cmd_check_lists(mock_client, [5102776])[0]
+    assert entry["lists_source"] == "comic-page"
+    assert entry["requested_id"] == 5102776
+    assert "5102776" in entry["warning"]
